@@ -88,20 +88,44 @@ export function registerInboundRoutes(fastify) {
 
         // Function to handle messages from ElevenLabs
         const handleElevenLabsMessage = (message, connection) => {
+          if (!message || typeof message !== 'object') {
+            console.error('[II] Invalid message format received from ElevenLabs');
+            return;
+          }
+
           switch (message.type) {
             case "conversation_initiation_metadata":
               console.info("[II] Received conversation initiation metadata.");
               break;
             case "audio":
               if (message.audio_event?.audio_base_64) {
-                const audioData = {
-                  event: "media",
-                  streamSid,
-                  media: {
-                    payload: message.audio_event.audio_base_64,
-                  },
-                };
-                connection.send(JSON.stringify(audioData));
+                // Validate streamSid exists
+                if (!streamSid) {
+                  console.error('[II] Cannot send audio: streamSid is not set');
+                  return;
+                }
+
+                try {
+                  // Ensure the payload is valid base64
+                  const isBase64 = /^[A-Za-z0-9+/=]+$/.test(message.audio_event.audio_base_64);
+                  if (!isBase64) {
+                    console.error('[II] Invalid base64 payload received from ElevenLabs');
+                    return;
+                  }
+
+                  const audioData = {
+                    event: "media",
+                    streamSid,
+                    media: {
+                      payload: message.audio_event.audio_base_64,
+                    },
+                  };
+                  connection.send(JSON.stringify(audioData));
+                } catch (error) {
+                  console.error('[II] Error processing audio message:', error);
+                }
+              } else {
+                console.error('[II] Audio event missing base64 payload');
               }
               break;
             case "interruption":

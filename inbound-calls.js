@@ -54,6 +54,24 @@ export function registerInboundRoutes(fastify) {
 
       let streamSid = null;
       let elevenLabsWs = null;
+      let isClosing = false;
+
+      const closeWithCode = (code, reason) => {
+        if (!isClosing) {
+          isClosing = true;
+          console.log(`[Server] Closing connection with code ${code}: ${reason}`);
+          
+          // Close ElevenLabs connection if open
+          if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
+            elevenLabsWs.close(1000, "Closing normally");
+          }
+          
+          // Close Twilio connection if open
+          if (connection.socket.readyState === WebSocket.OPEN) {
+            connection.socket.close(code, reason);
+          }
+        }
+      };
 
       // Handle messages from Twilio
       connection.socket.on("message", async (rawMessage) => {
@@ -63,6 +81,7 @@ export function registerInboundRoutes(fastify) {
           // Validate message format
           if (!data || !data.event) {
             console.error("[Twilio] Invalid message format:", rawMessage.toString());
+            closeWithCode(1003, "Invalid message format");
             return;
           }
 
@@ -70,6 +89,7 @@ export function registerInboundRoutes(fastify) {
             case "start":
               if (!data.start || !data.start.streamSid) {
                 console.error("[Twilio] Missing streamSid in start event");
+                closeWithCode(1003, "Missing streamSid");
                 return;
               }
               streamSid = data.start.streamSid;
@@ -78,16 +98,30 @@ export function registerInboundRoutes(fastify) {
               try {
                 // Get authenticated WebSocket URL
                 const signedUrl = await getSignedUrl();
+                
                 // Connect to ElevenLabs using the signed URL
                 elevenLabsWs = new WebSocket(signedUrl);
                 
+                // Set timeout for connection
+                const connectionTimeout = setTimeout(() => {
+                  if (elevenLabsWs.readyState !== WebSocket.OPEN) {
+                    closeWithCode(1006, "ElevenLabs connection timeout");
+                  }
+                }, 10000);
+
                 // Handle open event for ElevenLabs WebSocket
                 elevenLabsWs.on("open", () => {
+                  clearTimeout(connectionTimeout);
                   console.log("[II] Connected to Conversational AI.");
                 });
 
                 // Handle messages from ElevenLabs
                 elevenLabsWs.on("message", (data) => {
+                  if (connection.socket.readyState !== WebSocket.OPEN) {
+                    console.error("[II] Cannot send message: Twilio connection closed");
+                    return;
+                  }
+                  
                   try {
                     const message = JSON.parse(data);
                     handleElevenLabsMessage(message, connection.socket);
@@ -99,39 +133,52 @@ export function registerInboundRoutes(fastify) {
                 // Handle errors from ElevenLabs WebSocket
                 elevenLabsWs.on("error", (error) => {
                   console.error("[II] WebSocket error:", error);
+                  closeWithCode(1011, "ElevenLabs WebSocket error");
                 });
 
                 // Handle close event for ElevenLabs WebSocket
-                elevenLabsWs.on("close", () => {
-                  console.log("[II] Disconnected.");
+                elevenLabsWs.on("close", (code, reason) => {
+                  console.log(`[II] ElevenLabs disconnected with code ${code}: ${reason}`);
+                  closeWithCode(code, reason);
                 });
 
               } catch (error) {
                 console.error("[Server] Failed to initialize ElevenLabs connection:", error);
-                connection.socket.close();
+                closeWithCode(1011, "Failed to initialize ElevenLabs connection");
               }
               break;
+
             case "media":
-              if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
+              if (!elevenLabsWs || elevenLabsWs.readyState !== WebSocket.OPEN) {
+                console.error("[Twilio] Cannot process media: ElevenLabs connection not ready");
+                return;
+              }
+
+              if (!data.media || !data.media.payload) {
+                console.error("[Twilio] Invalid media message format");
+                return;
+              }
+
+              try {
                 const audioMessage = {
-                  user_audio_chunk: Buffer.from(
-                    data.media.payload,
-                    "base64"
-                  ).toString("base64"),
+                  user_audio_chunk: Buffer.from(data.media.payload, "base64").toString("base64")
                 };
                 elevenLabsWs.send(JSON.stringify(audioMessage));
+              } catch (error) {
+                console.error("[Twilio] Error processing media:", error);
               }
               break;
+
             case "stop":
-              if (elevenLabsWs) {
-                elevenLabsWs.close();
-              }
+              closeWithCode(1000, "Stop event received");
               break;
+
             default:
               console.log(`[Twilio] Received unhandled event: ${data.event}`);
           }
         } catch (error) {
           console.error("[Twilio] Error processing message:", error);
+          closeWithCode(1003, "Message processing error");
         }
       });
 
@@ -193,19 +240,15 @@ export function registerInboundRoutes(fastify) {
       };
 
       // Handle close event from Twilio
-      connection.on("close", () => {
-        if (elevenLabsWs) {
-          elevenLabsWs.close();
-        }
-        console.log("[Twilio] Client disconnected");
+      connection.socket.on("close", (code, reason) => {
+        console.log(`[Twilio] Client disconnected with code ${code}: ${reason}`);
+        closeWithCode(code || 1000, reason || "Connection closed");
       });
 
       // Handle errors from Twilio WebSocket
-      connection.on("error", (error) => {
+      connection.socket.on("error", (error) => {
         console.error("[Twilio] WebSocket error:", error);
-        if (elevenLabsWs) {
-          elevenLabsWs.close();
-        }
+        closeWithCode(1011, "Twilio WebSocket error");
       });
     });
   });
